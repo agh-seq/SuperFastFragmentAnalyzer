@@ -83,6 +83,7 @@ class OverlapStats:
             )
         
         overlaps = []
+        CHUNK_SIZE = 100000  # Process reads in chunks of 100k to avoid memory issues
         
         for chrom in chromosomes:
             reads_chr = reads_df.filter(pl.col("chromosome") == chrom)
@@ -91,48 +92,60 @@ class OverlapStats:
             if reads_chr.is_empty() or features_chr.is_empty():
                 continue
             
-            # Prepare frames for join
-            reads_join = reads_chr.rename({"chromosome": "seqname"}).with_columns(pl.lit(1).alias("_key"))
-            features_join = features_chr.with_columns(pl.lit(1).alias("_key"))
+            # Process reads in chunks to avoid memory explosion
+            num_reads = len(reads_chr)
+            chrom_overlaps = []
             
-            overlaps_chr = (
-                reads_join.join(features_join, on="_key", how="inner")
-                .filter(
-                    (pl.col("start") < pl.col("end_right"))
-                    & (pl.col("end") > pl.col("start_right"))
+            for i in range(0, num_reads, CHUNK_SIZE):
+                reads_chunk = reads_chr.slice(i, CHUNK_SIZE)
+                
+                # Prepare frames for join
+                reads_join = reads_chunk.rename({"chromosome": "seqname"}).with_columns(pl.lit(1).alias("_key"))
+                features_join = features_chr.with_columns(pl.lit(1).alias("_key"))
+                
+                overlaps_chunk = (
+                    reads_join.join(features_join, on="_key", how="inner")
+                    .filter(
+                        (pl.col("start") < pl.col("end_right"))
+                        & (pl.col("end") > pl.col("start_right"))
+                    )
+                    .rename(
+                        {
+                            "seqname": "chromosome",
+                            "start": "read_start",
+                            "end": "read_end",
+                            "start_right": "feature_start",
+                            "end_right": "feature_end",
+                        }
+                    )
+                    .drop("_key")
                 )
-                .rename(
-                    {
-                        "seqname": "chromosome",
-                        "start": "read_start",
-                        "end": "read_end",
-                        "start_right": "feature_start",
-                        "end_right": "feature_end",
-                    }
-                )
-                .drop("_key")
-            )
+                
+                if "fragment_length_right" in overlaps_chunk.columns:
+                    overlaps_chunk = overlaps_chunk.rename({"fragment_length_right": "fragment_length"})
+                if "size_category_right" in overlaps_chunk.columns:
+                    overlaps_chunk = overlaps_chunk.rename({"size_category_right": "size_category"})
+                if "genome_right" in overlaps_chunk.columns:
+                    overlaps_chunk = overlaps_chunk.rename({"genome_right": "genome"})
+                
+                if "fragment_length" not in overlaps_chunk.columns:
+                    overlaps_chunk = overlaps_chunk.with_columns(
+                        (pl.col("read_end") - pl.col("read_start")).alias("fragment_length")
+                    )
+                if "size_category" not in overlaps_chunk.columns:
+                    from superfast_fragment_analyzer.bed_processor import BedProcessor
+                    overlaps_chunk = overlaps_chunk.with_columns(
+                        pl.col("fragment_length")
+                        .map_elements(BedProcessor._classify_fragment_size, return_dtype=pl.Utf8)
+                        .alias("size_category")
+                    )
+                
+                if not overlaps_chunk.is_empty():
+                    chrom_overlaps.append(overlaps_chunk)
             
-            if "fragment_length_right" in overlaps_chr.columns:
-                overlaps_chr = overlaps_chr.rename({"fragment_length_right": "fragment_length"})
-            if "size_category_right" in overlaps_chr.columns:
-                overlaps_chr = overlaps_chr.rename({"size_category_right": "size_category"})
-            if "genome_right" in overlaps_chr.columns:
-                overlaps_chr = overlaps_chr.rename({"genome_right": "genome"})
-            
-            if "fragment_length" not in overlaps_chr.columns:
-                overlaps_chr = overlaps_chr.with_columns(
-                    (pl.col("read_end") - pl.col("read_start")).alias("fragment_length")
-                )
-            if "size_category" not in overlaps_chr.columns:
-                from superfast_fragment_analyzer.bed_processor import BedProcessor
-                overlaps_chr = overlaps_chr.with_columns(
-                    pl.col("fragment_length")
-                    .map_elements(BedProcessor._classify_fragment_size, return_dtype=pl.Utf8)
-                    .alias("size_category")
-                )
-            
-            overlaps.append(overlaps_chr)
+            # Concatenate all chunks for this chromosome
+            if chrom_overlaps:
+                overlaps.append(pl.concat(chrom_overlaps))
         
         if not overlaps:
             return pl.DataFrame(
