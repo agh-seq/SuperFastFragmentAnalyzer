@@ -104,6 +104,15 @@ class OverlapStats:
                     pl.col("start").alias("feature_start"),
                     pl.col("end").alias("feature_end"),
                 ])
+                .select([
+                    "seqname",
+                    "feature_start",
+                    "feature_end",
+                    "feature_type",
+                    "gene_id",
+                    "gene_name",
+                    "genome",
+                ])
             )
             
             # Use cross join with filtering - more efficient than Cartesian on full dataset
@@ -131,7 +140,7 @@ class OverlapStats:
                     "feature_start",
                     "feature_end",
                 ])
-                .drop("genome_right")
+                .drop("genome_right", strict=False)
             )
             
             overlap_frames.append(chrom_overlaps)
