@@ -27,46 +27,47 @@ class OverlapStats:
         self._gtf_features_df = None
     
     @property
-    def bed_df(self) -> pl.DataFrame:
+    def bed_df(self) -> pl.LazyFrame:
         """Lazy load BED DataFrame from Parquet if needed."""
         if self._bed_df is None:
             if isinstance(self.bed_source, Path):
-                self._bed_df = pl.read_parquet(self.bed_source)
+                self._bed_df = pl.scan_parquet(self.bed_source)
             else:
-                self._bed_df = self.bed_source
+                self._bed_df = self.bed_source.lazy() if isinstance(self.bed_source, pl.DataFrame) else self.bed_source
         return self._bed_df
     
     @property
-    def gtf_features_df(self) -> pl.DataFrame:
+    def gtf_features_df(self) -> pl.LazyFrame:
         """Lazy load GTF features DataFrame from Parquet if needed."""
         if self._gtf_features_df is None:
             if isinstance(self.gtf_features_source, Path):
-                self._gtf_features_df = pl.read_parquet(self.gtf_features_source)
+                self._gtf_features_df = pl.scan_parquet(self.gtf_features_source)
             else:
-                self._gtf_features_df = self.gtf_features_source
+                self._gtf_features_df = self.gtf_features_source.lazy() if isinstance(self.gtf_features_source, pl.DataFrame) else self.gtf_features_source
         return self._gtf_features_df
     
     def _compute_overlaps(
         self,
-        reads_df: pl.DataFrame,
-        features_df: pl.DataFrame,
-    ) -> pl.DataFrame:
+        reads_df: pl.LazyFrame,
+        features_df: pl.LazyFrame,
+    ) -> pl.LazyFrame:
         """
         Compute overlaps between reads and features using interval joins.
         
         Args:
-            reads_df: Reads DataFrame
-            features_df: Features DataFrame
+            reads_df: Reads LazyFrame
+            features_df: Features LazyFrame
             
         Returns:
-            DataFrame with overlapping reads and their feature types
+            LazyFrame with overlapping reads and their feature types
         """
-        read_chromosomes = set(reads_df["chromosome"].unique().to_list())
-        feature_chromosomes = set(features_df["seqname"].unique().to_list())
+        # Get chromosomes efficiently without materializing
+        read_chromosomes = set(reads_df.select("chromosome").unique().collect()["chromosome"].to_list())
+        feature_chromosomes = set(features_df.select("seqname").unique().collect()["seqname"].to_list())
         chromosomes = sorted(read_chromosomes & feature_chromosomes)
         
         if not chromosomes:
-            return pl.DataFrame(
+            return pl.LazyFrame(
                 schema={
                     "chromosome": pl.Utf8,
                     "read_start": pl.Int64,
@@ -82,81 +83,61 @@ class OverlapStats:
                 }
             )
         
-        overlaps = []
-        READ_CHUNK_SIZE = 10000  # Process reads in small chunks to limit memory
-        FEATURE_CHUNK_SIZE = 50000  # Process features in chunks too
+        # Process chromosome by chromosome to limit memory
+        # Build lazy frame operations for each chromosome and union them
+        overlap_frames = []
         
         for chrom in chromosomes:
-            reads_chr = reads_df.filter(pl.col("chromosome") == chrom)
-            features_chr = features_df.filter(pl.col("seqname") == chrom)
+            reads_chr = (
+                reads_df
+                .filter(pl.col("chromosome") == chrom)
+                .with_columns([
+                    pl.col("start").alias("read_start"),
+                    pl.col("end").alias("read_end"),
+                ])
+            )
             
-            if reads_chr.is_empty() or features_chr.is_empty():
-                continue
+            features_chr = (
+                features_df
+                .filter(pl.col("seqname") == chrom)
+                .with_columns([
+                    pl.col("start").alias("feature_start"),
+                    pl.col("end").alias("feature_end"),
+                ])
+            )
             
-            # Process both reads and features in chunks to avoid memory explosion
-            num_reads = len(reads_chr)
-            num_features = len(features_chr)
-            chrom_overlaps = []
+            # Use cross join with filtering - more efficient than Cartesian on full dataset
+            # Polars will optimize this better when done per-chromosome
+            chrom_overlaps = (
+                reads_chr.join(
+                    features_chr,
+                    how="cross",
+                    suffix="_right"
+                )
+                .filter(
+                    (pl.col("read_start") < pl.col("feature_end"))
+                    & (pl.col("read_end") > pl.col("feature_start"))
+                )
+                .select([
+                    "chromosome",
+                    "read_start",
+                    "read_end",
+                    pl.coalesce([pl.col("fragment_length"), (pl.col("read_end") - pl.col("read_start"))]).alias("fragment_length"),
+                    pl.coalesce([pl.col("size_category"), pl.lit(None).cast(pl.Utf8)]).alias("size_category"),
+                    pl.coalesce([pl.col("genome"), pl.col("genome_right")]).alias("genome"),
+                    "feature_type",
+                    "gene_id",
+                    "gene_name",
+                    "feature_start",
+                    "feature_end",
+                ])
+                .drop("genome_right")
+            )
             
-            # Double chunking: process reads in chunks, and for each read chunk,
-            # process features in chunks too
-            for read_start in range(0, num_reads, READ_CHUNK_SIZE):
-                reads_chunk = reads_chr.slice(read_start, READ_CHUNK_SIZE)
-                
-                # Process features in chunks for this read chunk
-                for feat_start in range(0, num_features, FEATURE_CHUNK_SIZE):
-                    features_chunk = features_chr.slice(feat_start, FEATURE_CHUNK_SIZE)
-                    
-                    # Prepare frames for join
-                    reads_join = reads_chunk.rename({"chromosome": "seqname"}).with_columns(pl.lit(1).alias("_key"))
-                    features_join = features_chunk.with_columns(pl.lit(1).alias("_key"))
-                    
-                    overlaps_chunk = (
-                        reads_join.join(features_join, on="_key", how="inner")
-                        .filter(
-                            (pl.col("start") < pl.col("end_right"))
-                            & (pl.col("end") > pl.col("start_right"))
-                        )
-                        .rename(
-                            {
-                                "seqname": "chromosome",
-                                "start": "read_start",
-                                "end": "read_end",
-                                "start_right": "feature_start",
-                                "end_right": "feature_end",
-                            }
-                        )
-                        .drop("_key")
-                    )
-                    
-                    if "fragment_length_right" in overlaps_chunk.columns:
-                        overlaps_chunk = overlaps_chunk.rename({"fragment_length_right": "fragment_length"})
-                    if "size_category_right" in overlaps_chunk.columns:
-                        overlaps_chunk = overlaps_chunk.rename({"size_category_right": "size_category"})
-                    if "genome_right" in overlaps_chunk.columns:
-                        overlaps_chunk = overlaps_chunk.rename({"genome_right": "genome"})
-                    
-                    if "fragment_length" not in overlaps_chunk.columns:
-                        overlaps_chunk = overlaps_chunk.with_columns(
-                            (pl.col("read_end") - pl.col("read_start")).alias("fragment_length")
-                        )
-                    if "size_category" not in overlaps_chunk.columns:
-                        from superfast_fragment_analyzer.bed_processor import BedProcessor
-                        overlaps_chunk = overlaps_chunk.with_columns(
-                            pl.col("fragment_length")
-                            .map_elements(BedProcessor._classify_fragment_size, return_dtype=pl.Utf8)
-                            .alias("size_category")
-                        )
-                    
-                    if not overlaps_chunk.is_empty():
-                        chrom_overlaps.append(overlaps_chunk)
-            
-            # Concatenate all chunks for this chromosome
-            if chrom_overlaps:
-                overlaps.append(pl.concat(chrom_overlaps))
+            overlap_frames.append(chrom_overlaps)
         
-        if not overlaps:
-            return pl.DataFrame(
+        if not overlap_frames:
+            return pl.LazyFrame(
                 schema={
                     "chromosome": pl.Utf8,
                     "read_start": pl.Int64,
@@ -172,7 +153,25 @@ class OverlapStats:
                 }
             )
         
-        return pl.concat(overlaps)
+        # Union all chromosome overlaps
+        result = overlap_frames[0]
+        for frame in overlap_frames[1:]:
+            result = pl.concat([result, frame])
+        
+        # Add size_category if missing
+        if "size_category" not in result.columns or result.select(pl.col("size_category").is_null().sum()).collect().item() > 0:
+            from superfast_fragment_analyzer.bed_processor import BedProcessor
+            result = result.with_columns(
+                pl.when(pl.col("size_category").is_null())
+                .then(
+                    pl.col("fragment_length")
+                    .map_elements(BedProcessor._classify_fragment_size, return_dtype=pl.Utf8)
+                )
+                .otherwise(pl.col("size_category"))
+                .alias("size_category")
+            )
+        
+        return result
     
     def compute_statistics(
         self,
@@ -195,17 +194,35 @@ class OverlapStats:
             reads_df = reads_df.filter(pl.col("genome") == genome_filter)
             features_df = features_df.filter(pl.col("genome") == genome_filter)
         
-        # Compute overlaps
-        overlaps_df = self._compute_overlaps(reads_df, features_df)
+        # Compute overlaps (returns LazyFrame)
+        overlaps_lazy = self._compute_overlaps(reads_df, features_df)
         
-        if overlaps_df.is_empty():
-            # Return empty statistics
+        # Materialize overlaps only when needed for statistics
+        # First check if empty efficiently
+        overlaps_count = overlaps_lazy.select(pl.len()).collect().item()
+        if overlaps_count == 0:
+            # Return empty statistics - get total reads efficiently
+            total_reads = reads_df.select(pl.len()).collect().item()
             return {
-                "overlaps": overlaps_df,
+                "overlaps": pl.DataFrame(
+                    schema={
+                        "chromosome": pl.Utf8,
+                        "read_start": pl.Int64,
+                        "read_end": pl.Int64,
+                        "fragment_length": pl.Int64,
+                        "size_category": pl.Utf8,
+                        "genome": pl.Utf8,
+                        "feature_type": pl.Utf8,
+                        "gene_id": pl.Utf8,
+                        "gene_name": pl.Utf8,
+                        "feature_start": pl.Int64,
+                        "feature_end": pl.Int64,
+                    }
+                ),
                 "summary": pl.DataFrame({
                     "feature_type": ["exon", "intron", "promoter"],
                     "overlapping_reads": [0, 0, 0],
-                    "total_reads": [len(reads_df), len(reads_df), len(reads_df)],
+                    "total_reads": [total_reads, total_reads, total_reads],
                     "percentage": [0.0, 0.0, 0.0],
                     "median_fragment_length": [None, None, None],
                 }),
@@ -219,23 +236,44 @@ class OverlapStats:
                 ),
             }
         
-        # Count overlaps by feature type
-        total_reads = len(reads_df)
-        unique_reads_with_overlaps = len(
-            overlaps_df.select(["read_start", "read_end"]).unique()
+        # Get total reads efficiently
+        total_reads = reads_df.select(pl.len()).collect().item()
+        
+        # Compute statistics using lazy evaluation
+        # Get unique reads with overlaps
+        unique_reads_with_overlaps = (
+            overlaps_lazy
+            .select(["read_start", "read_end"])
+            .unique()
+            .select(pl.len())
+            .collect()
+            .item()
         )
         
+        # Compute summary statistics using lazy evaluation
         summary_data = []
         for feature_type in ["exon", "intron", "promoter"]:
-            feature_overlaps = overlaps_df.filter(pl.col("feature_type") == feature_type)
-            if not feature_overlaps.is_empty():
-                overlapping_reads = len(
-                    feature_overlaps.select(["read_start", "read_end"]).unique()
+            feature_overlaps_lazy = overlaps_lazy.filter(pl.col("feature_type") == feature_type)
+            
+            # Count unique reads efficiently
+            overlapping_reads = (
+                feature_overlaps_lazy
+                .select(["read_start", "read_end"])
+                .unique()
+                .select(pl.len())
+                .collect()
+                .item()
+            )
+            
+            # Calculate median fragment length efficiently
+            if overlapping_reads > 0:
+                median_length = (
+                    feature_overlaps_lazy
+                    .select(pl.col("fragment_length").median())
+                    .collect()
+                    .item()
                 )
-                # Calculate median fragment length for this feature type
-                median_length = feature_overlaps["fragment_length"].median()
             else:
-                overlapping_reads = 0
                 median_length = None
             
             percentage = (overlapping_reads / total_reads * 100) if total_reads > 0 else 0.0
@@ -253,19 +291,34 @@ class OverlapStats:
         # Create fragment length statistics by feature type and size category
         fragment_stats_data = []
         for feature_type in ["exon", "intron", "promoter"]:
-            feature_overlaps = overlaps_df.filter(pl.col("feature_type") == feature_type)
-            if not feature_overlaps.is_empty():
-                for size_cat in ["sub-nucleosome", "mono-nucleosome", "di-nucleosome", "tri-nucleosome"]:
-                    size_overlaps = feature_overlaps.filter(pl.col("size_category") == size_cat)
-                    if not size_overlaps.is_empty():
-                        count = len(size_overlaps.select(["read_start", "read_end"]).unique())
-                        median_length = size_overlaps["fragment_length"].median()
-                        fragment_stats_data.append({
-                            "feature_type": feature_type,
-                            "size_category": size_cat,
-                            "count": count,
-                            "median_fragment_length": median_length,
-                        })
+            feature_overlaps_lazy = overlaps_lazy.filter(pl.col("feature_type") == feature_type)
+            
+            for size_cat in ["sub-nucleosome", "mono-nucleosome", "di-nucleosome", "tri-nucleosome"]:
+                size_overlaps_lazy = feature_overlaps_lazy.filter(pl.col("size_category") == size_cat)
+                
+                # Count unique reads efficiently
+                count = (
+                    size_overlaps_lazy
+                    .select(["read_start", "read_end"])
+                    .unique()
+                    .select(pl.len())
+                    .collect()
+                    .item()
+                )
+                
+                if count > 0:
+                    median_length = (
+                        size_overlaps_lazy
+                        .select(pl.col("fragment_length").median())
+                        .collect()
+                        .item()
+                    )
+                    fragment_stats_data.append({
+                        "feature_type": feature_type,
+                        "size_category": size_cat,
+                        "count": count,
+                        "median_fragment_length": median_length,
+                    })
         
         fragment_stats_df = pl.DataFrame(fragment_stats_data) if fragment_stats_data else pl.DataFrame(
             schema={
@@ -275,6 +328,10 @@ class OverlapStats:
                 "median_fragment_length": pl.Float64,
             }
         )
+        
+        # Materialize overlaps DataFrame only at the end, and write directly to disk if possible
+        # For now, collect it but this could be optimized further to write streaming
+        overlaps_df = overlaps_lazy.collect()
         
         return {
             "overlaps": overlaps_df,

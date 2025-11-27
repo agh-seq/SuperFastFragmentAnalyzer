@@ -101,35 +101,43 @@ class GtfProcessor:
             },
         )
         
-        # Parse attributes
-        parsed_attrs = [
-            self._parse_attributes(attr)
-            for attr in df["attributes"].to_list()
-        ]
+        # Parse attributes using Polars expressions instead of converting to Python list
+        # This is much more memory efficient for large files
+        # Extract common attributes using string operations
+        df = df.with_columns([
+            # Extract gene_id
+            pl.col("attributes")
+            .str.extract(r'gene_id\s+"([^"]+)"', 1)
+            .alias("gene_id"),
+            # Extract transcript_id
+            pl.col("attributes")
+            .str.extract(r'transcript_id\s+"([^"]+)"', 1)
+            .alias("transcript_id"),
+            # Extract gene_name
+            pl.col("attributes")
+            .str.extract(r'gene_name\s+"([^"]+)"', 1)
+            .alias("gene_name"),
+            # Extract gene_biotype (preferred)
+            pl.col("attributes")
+            .str.extract(r'gene_biotype\s+"([^"]+)"', 1)
+            .alias("gene_biotype"),
+            # Extract transcript_biotype (fallback)
+            pl.col("attributes")
+            .str.extract(r'transcript_biotype\s+"([^"]+)"', 1)
+            .alias("transcript_biotype"),
+        ])
         
-        # Create DataFrame with all possible attribute keys
-        all_keys = set()
-        for attrs in parsed_attrs:
-            all_keys.update(attrs.keys())
+        # Use gene_biotype if available, otherwise use transcript_biotype
+        df = df.with_columns(
+            pl.coalesce([pl.col("gene_biotype"), pl.col("transcript_biotype")])
+            .alias("biotype")
+        )
         
-        # Build columns for each attribute
-        attr_columns = {}
-        for key in all_keys:
-            attr_columns[key] = [
-                attrs.get(key, None) for attrs in parsed_attrs
-            ]
-        
-        # Add parsed columns
-        if "gene_id" in attr_columns:
-            df = df.with_columns(pl.Series("gene_id", attr_columns["gene_id"]))
-        else:
+        # Check if gene_id exists
+        if df["gene_id"].null_count() == len(df):
             raise ValueError("GTF file must contain 'gene_id' attribute")
         
-        if "transcript_id" in attr_columns:
-            df = df.with_columns(pl.Series("transcript_id", attr_columns["transcript_id"]))
-        
-        if "gene_name" in attr_columns:
-            df = df.with_columns(pl.Series("gene_name", attr_columns["gene_name"]))
+        # Columns already added above using string extraction
         
         # Add genome classification
         df = df.with_columns(
@@ -162,9 +170,13 @@ class GtfProcessor:
         else:  # strand == "-"
             return transcript_df["end_0based"].max()
     
-    def extract_features(self) -> pl.DataFrame:
+    def extract_features(self, biotype_filter: Optional[str] = None) -> pl.DataFrame:
         """
         Extract exons, introns, and promoters from GTF.
+        
+        Args:
+            biotype_filter: Optional biotype to filter by (e.g., "protein_coding").
+                           If None, includes all biotypes.
         
         Returns:
             DataFrame with columns: seqname, start, end, feature_type, gene_id, gene_name, genome, strand
@@ -176,95 +188,136 @@ class GtfProcessor:
             pl.col("feature").is_in(["gene", "transcript", "exon"])
         )
         
+        # Filter by biotype if specified
+        if biotype_filter:
+            # Get gene IDs that match the biotype filter
+            # Check both gene-level and transcript-level features for biotype
+            matching_genes = (
+                feature_df
+                .filter(pl.col("biotype") == biotype_filter)
+                .select("gene_id")
+                .drop_nulls()
+                .unique()
+            )
+            
+            # Filter feature_df to only include matching genes
+            if len(matching_genes) > 0:
+                matching_gene_list = matching_genes["gene_id"].to_list()
+                feature_df = feature_df.filter(pl.col("gene_id").is_in(matching_gene_list))
+            else:
+                # No matching genes found, return empty result
+                return pl.DataFrame(
+                    schema={
+                        "seqname": pl.Utf8,
+                        "start": pl.Int64,
+                        "end": pl.Int64,
+                        "feature_type": pl.Utf8,
+                        "gene_id": pl.Utf8,
+                        "gene_name": pl.Utf8,
+                        "genome": pl.Utf8,
+                        "strand": pl.Utf8,
+                    }
+                )
+        
         all_features = []
         
-        # Process by gene
-        for gene_id_val in feature_df["gene_id"].unique().to_list():
-            gene_data = feature_df.filter(pl.col("gene_id") == gene_id_val)
+        # Process by gene - use lazy evaluation to avoid loading all at once
+        # Get unique gene IDs efficiently
+        unique_gene_ids = feature_df["gene_id"].drop_nulls().unique().to_list()
+        
+        # Process in chunks to limit memory
+        GENE_CHUNK_SIZE = 1000
+        for chunk_start in range(0, len(unique_gene_ids), GENE_CHUNK_SIZE):
+            gene_chunk = unique_gene_ids[chunk_start:chunk_start + GENE_CHUNK_SIZE]
+            gene_data_chunk = feature_df.filter(pl.col("gene_id").is_in(gene_chunk))
             
-            if gene_data.is_empty():
-                continue
+            for gene_id_val in gene_chunk:
+                gene_data = gene_data_chunk.filter(pl.col("gene_id") == gene_id_val)
             
-            # Get gene info
-            gene_row = gene_data.filter(pl.col("feature") == "gene").head(1)
-            if gene_row.is_empty():
-                continue
+                if gene_data.is_empty():
+                    continue
+                
+                # Get gene info
+                gene_row = gene_data.filter(pl.col("feature") == "gene").head(1)
+                if gene_row.is_empty():
+                    continue
+                
+                seqname = gene_row["seqname"][0]
+                strand = gene_row["strand"][0]
+                gene_name = gene_row.get_column("gene_name")[0] if "gene_name" in gene_row.columns and gene_row["gene_name"][0] is not None else None
+                genome = gene_row["genome"][0]
+                
+                # Get all transcripts for this gene
+                transcripts = gene_data.filter(pl.col("feature") == "transcript")["transcript_id"].drop_nulls().unique().to_list()
             
-            seqname = gene_row["seqname"][0]
-            strand = gene_row["strand"][0]
-            gene_name = gene_row.get_column("gene_name")[0] if "gene_name" in gene_row.columns else None
-            genome = gene_row["genome"][0]
-            
-            # Get all transcripts for this gene
-            transcripts = gene_data.filter(pl.col("feature") == "transcript")["transcript_id"].unique().to_list()
-            
-            # Collect exons
-            exons = []
-            for transcript_id in transcripts:
-                transcript_exons = gene_data.filter(
-                    (pl.col("feature") == "exon") & (pl.col("transcript_id") == transcript_id)
-                )
-                for row in transcript_exons.iter_rows(named=True):
-                    exons.append({
+                # Collect exons
+                exons = []
+                for transcript_id in transcripts:
+                    transcript_exons = gene_data.filter(
+                        (pl.col("feature") == "exon") & (pl.col("transcript_id") == transcript_id)
+                    )
+                    # Use to_dicts() instead of iter_rows() for better performance
+                    for row in transcript_exons.to_dicts():
+                        exons.append({
+                            "seqname": seqname,
+                            "start": row["start_0based"],
+                            "end": row["end_0based"],
+                            "feature_type": "exon",
+                            "gene_id": gene_id_val,
+                            "gene_name": gene_name,
+                            "genome": genome,
+                            "strand": strand,
+                        })
+                
+                # Calculate introns (gaps between exons within transcripts)
+                introns = []
+                for transcript_id in transcripts:
+                    transcript_exons = gene_data.filter(
+                        (pl.col("feature") == "exon") & (pl.col("transcript_id") == transcript_id)
+                    ).sort("start_0based")
+                    
+                    if transcript_exons.height > 1:
+                        for i in range(transcript_exons.height - 1):
+                            exon_end = transcript_exons["end_0based"][i]
+                            next_exon_start = transcript_exons["start_0based"][i + 1]
+                            
+                            if next_exon_start > exon_end:
+                                introns.append({
+                                    "seqname": seqname,
+                                    "start": exon_end,
+                                    "end": next_exon_start,
+                                    "feature_type": "intron",
+                                    "gene_id": gene_id_val,
+                                    "gene_name": gene_name,
+                                    "genome": genome,
+                                    "strand": strand,
+                                })
+                
+                # Calculate promoters (±2kb from TSS)
+                promoters = []
+                for transcript_id in transcripts:
+                    transcript_data = gene_data.filter(pl.col("transcript_id") == transcript_id)
+                    tss = self._get_transcript_start(transcript_data)
+                    
+                    # Promoter is ±2kb from TSS regardless of strand
+                    # For both strands, we want the region around TSS
+                    promoter_start = max(0, tss - self.PROMOTER_UPSTREAM)
+                    promoter_end = tss + self.PROMOTER_DOWNSTREAM
+                    
+                    promoters.append({
                         "seqname": seqname,
-                        "start": row["start_0based"],
-                        "end": row["end_0based"],
-                        "feature_type": "exon",
+                        "start": promoter_start,
+                        "end": promoter_end,
+                        "feature_type": "promoter",
                         "gene_id": gene_id_val,
                         "gene_name": gene_name,
                         "genome": genome,
                         "strand": strand,
                     })
-            
-            # Calculate introns (gaps between exons within transcripts)
-            introns = []
-            for transcript_id in transcripts:
-                transcript_exons = gene_data.filter(
-                    (pl.col("feature") == "exon") & (pl.col("transcript_id") == transcript_id)
-                ).sort("start_0based")
                 
-                if transcript_exons.height > 1:
-                    for i in range(transcript_exons.height - 1):
-                        exon_end = transcript_exons["end_0based"][i]
-                        next_exon_start = transcript_exons["start_0based"][i + 1]
-                        
-                        if next_exon_start > exon_end:
-                            introns.append({
-                                "seqname": seqname,
-                                "start": exon_end,
-                                "end": next_exon_start,
-                                "feature_type": "intron",
-                                "gene_id": gene_id_val,
-                                "gene_name": gene_name,
-                                "genome": genome,
-                                "strand": strand,
-                            })
-            
-            # Calculate promoters (±2kb from TSS)
-            promoters = []
-            for transcript_id in transcripts:
-                transcript_data = gene_data.filter(pl.col("transcript_id") == transcript_id)
-                tss = self._get_transcript_start(transcript_data)
-                
-                # Promoter is ±2kb from TSS regardless of strand
-                # For both strands, we want the region around TSS
-                promoter_start = max(0, tss - self.PROMOTER_UPSTREAM)
-                promoter_end = tss + self.PROMOTER_DOWNSTREAM
-                
-                promoters.append({
-                    "seqname": seqname,
-                    "start": promoter_start,
-                    "end": promoter_end,
-                    "feature_type": "promoter",
-                    "gene_id": gene_id_val,
-                    "gene_name": gene_name,
-                    "genome": genome,
-                    "strand": strand,
-                })
-            
-            all_features.extend(exons)
-            all_features.extend(introns)
-            all_features.extend(promoters)
+                all_features.extend(exons)
+                all_features.extend(introns)
+                all_features.extend(promoters)
         
         # Convert to DataFrame
         if not all_features:

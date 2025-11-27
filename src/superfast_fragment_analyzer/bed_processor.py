@@ -64,8 +64,8 @@ class BedProcessor:
         Returns:
             DataFrame with columns: chromosome, start, end, fragment_length, size_category, genome
         """
-        # Read BED file (3 columns: chromosome, start, end)
-        df = pl.read_csv(
+        # Read BED file using lazy evaluation for better memory efficiency
+        df_lazy = pl.scan_csv(
             self.bed_file,
             separator="\t",
             has_header=False,
@@ -74,25 +74,34 @@ class BedProcessor:
         )
         
         # Calculate fragment length (end - start)
-        df = df.with_columns(
+        df_lazy = df_lazy.with_columns(
             (pl.col("end") - pl.col("start")).alias("fragment_length")
         )
         
-        # Classify fragment size
-        df = df.with_columns(
-            pl.col("fragment_length")
-            .map_elements(self._classify_fragment_size, return_dtype=pl.Utf8)
+        # Classify fragment size using when/then instead of map_elements for better performance
+        df_lazy = df_lazy.with_columns(
+            pl.when(pl.col("fragment_length") <= 100)
+            .then(pl.lit("sub-nucleosome"))
+            .when(pl.col("fragment_length") <= 250)
+            .then(pl.lit("mono-nucleosome"))
+            .when(pl.col("fragment_length") <= 420)
+            .then(pl.lit("di-nucleosome"))
+            .otherwise(pl.lit("tri-nucleosome"))
             .alias("size_category")
         )
         
-        # Add genome classification
-        df = df.with_columns(
-            pl.col("chromosome")
-            .map_elements(self._determine_genome, return_dtype=pl.Utf8)
+        # Add genome classification using when/then
+        df_lazy = df_lazy.with_columns(
+            pl.when(pl.col("chromosome").str.starts_with("chr"))
+            .then(pl.lit("human"))
+            .when(pl.col("chromosome").str.starts_with("NC_"))
+            .then(pl.lit("pig"))
+            .otherwise(pl.lit("unknown"))
             .alias("genome")
         )
         
-        return df
+        # Collect the lazy frame
+        return df_lazy.collect()
     
     def to_parquet(
         self,

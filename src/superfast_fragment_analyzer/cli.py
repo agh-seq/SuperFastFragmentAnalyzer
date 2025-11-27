@@ -68,11 +68,18 @@ def bed_to_parquet(
     type=click.Path(path_type=Path),
     help="Output Parquet file path (default: gtf_file_features.parquet)",
 )
-def extract_features(gtf_file: Path, output: Optional[Path]):
+@click.option(
+    "--biotype",
+    "-b",
+    type=str,
+    default=None,
+    help="Filter by biotype (e.g., 'protein_coding'). If not specified, includes all biotypes.",
+)
+def extract_features(gtf_file: Path, output: Optional[Path], biotype: Optional[str]):
     """Extract exons, introns, and promoters from GTF file."""
     try:
         processor = GtfProcessor(gtf_file)
-        features_df = processor.extract_features()
+        features_df = processor.extract_features(biotype_filter=biotype)
         
         if output is None:
             output = gtf_file.parent / f"{gtf_file.stem}_features.parquet"
@@ -81,6 +88,8 @@ def extract_features(gtf_file: Path, output: Optional[Path]):
         click.echo(f"Successfully extracted features to {output}")
         click.echo(f"Total features: {len(features_df)}")
         click.echo(f"Feature types: {features_df['feature_type'].value_counts()}")
+        if biotype:
+            click.echo(f"Filtered by biotype: {biotype}")
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -107,12 +116,20 @@ def extract_features(gtf_file: Path, output: Optional[Path]):
     is_flag=True,
     help="Keep intermediate BED and GTF Parquet files",
 )
+@click.option(
+    "--biotype",
+    "-b",
+    type=str,
+    default=None,
+    help="Filter GTF features by biotype (e.g., 'protein_coding'). If not specified, includes all biotypes.",
+)
 def compute_overlaps(
     bed_file: Path,
     gtf_file: Path,
     output_dir: Path,
     prefix: str,
     keep_parquet: bool,
+    biotype: Optional[str],
 ):
     """Compute overlap statistics between BED reads and GTF features."""
     try:
@@ -132,9 +149,11 @@ def compute_overlaps(
         
         # Step 2: Extract GTF features and save to Parquet
         click.echo(f"Processing GTF file and extracting features: {gtf_file}")
+        if biotype:
+            click.echo(f"  Filtering by biotype: {biotype}")
         gtf_parquet = output_dir / f"{prefix}_gtf_features.parquet"
         gtf_processor = GtfProcessor(gtf_file)
-        features_df = gtf_processor.extract_features()
+        features_df = gtf_processor.extract_features(biotype_filter=biotype)
         features_df.write_parquet(gtf_parquet, compression="zstd", compression_level=3)
         click.echo(f"  Saved to: {gtf_parquet}")
         click.echo(f"  Extracted {len(features_df)} features")
