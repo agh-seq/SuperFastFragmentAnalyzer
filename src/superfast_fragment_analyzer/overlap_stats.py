@@ -406,4 +406,131 @@ class OverlapStats:
             output_files[f"{genome_type}_overlaps"] = overlaps_path
         
         return output_files
+    
+    @staticmethod
+    def generate_feature_counts(
+        overlaps_df: pl.DataFrame,
+        feature_type: Optional[str] = None,
+    ) -> pl.DataFrame:
+        """
+        Generate gene count table filtered by feature type.
+        
+        Counts unique reads per gene for a specific feature type (exon, intron, promoter)
+        or across all feature types if None.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, feature_type, read_start, read_end
+            feature_type: Feature type to filter by ('exon', 'intron', 'promoter', or None for all)
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        if overlaps_df.is_empty():
+            return pl.DataFrame(
+                schema={
+                    "gene_id": pl.Utf8,
+                    "gene_name": pl.Utf8,
+                    "read_count": pl.Int64,
+                }
+            )
+        
+        # Filter by feature type if specified
+        filtered_df = overlaps_df
+        if feature_type is not None:
+            if feature_type not in ["exon", "intron", "promoter"]:
+                raise ValueError(f"feature_type must be 'exon', 'intron', 'promoter', or None, got: {feature_type}")
+            filtered_df = overlaps_df.filter(pl.col("feature_type") == feature_type)
+        
+        # Generate counts
+        counts = (
+            filtered_df
+            .select(["gene_id", "gene_name", "read_start", "read_end"])
+            .unique(subset=["gene_id", "read_start", "read_end"])  # Count each read only once per gene
+            .group_by(["gene_id", "gene_name"])
+            .agg(pl.count().alias("read_count"))
+            .sort("read_count", descending=True)
+        )
+        
+        return counts
+    
+    @staticmethod
+    def generate_gene_counts(overlaps_df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Generate gene count table from overlaps DataFrame.
+        
+        Counts unique reads per gene across all feature types.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, read_start, read_end
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        return OverlapStats.generate_feature_counts(overlaps_df, feature_type=None)
+    
+    @staticmethod
+    def generate_exon_counts(overlaps_df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Generate exon count table with per-gene aggregate counts over exons.
+        
+        Counts unique reads per gene that overlap exons.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, feature_type, read_start, read_end
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        return OverlapStats.generate_feature_counts(overlaps_df, feature_type="exon")
+    
+    def save_statistics_with_counts(
+        self,
+        output_dir: Path,
+        prefix: str = "overlap_stats",
+    ) -> Dict[str, Path]:
+        """
+        Save statistics to files including gene and exon count tables.
+        
+        Args:
+            output_dir: Directory to save statistics files
+            prefix: Prefix for output files
+            
+        Returns:
+            Dictionary mapping statistic type to output file path
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        all_stats = self.compute_all_statistics()
+        output_files = {}
+        
+        for genome_type, stats in all_stats.items():
+            # Save summary
+            summary_path = output_dir / f"{prefix}_{genome_type}_summary.tsv"
+            stats["summary"].write_csv(summary_path, separator="\t")
+            output_files[f"{genome_type}_summary"] = summary_path
+            
+            # Save fragment length statistics
+            fragment_stats_path = output_dir / f"{prefix}_{genome_type}_fragment_stats.tsv"
+            stats["fragment_stats"].write_csv(fragment_stats_path, separator="\t")
+            output_files[f"{genome_type}_fragment_stats"] = fragment_stats_path
+            
+            # Save detailed overlaps
+            overlaps_path = output_dir / f"{prefix}_{genome_type}_overlaps.parquet"
+            stats["overlaps"].write_parquet(overlaps_path)
+            output_files[f"{genome_type}_overlaps"] = overlaps_path
+            
+            # Generate and save gene counts
+            gene_counts = self.generate_gene_counts(stats["overlaps"])
+            gene_counts_path = output_dir / f"{prefix}_{genome_type}_gene_counts.tsv"
+            gene_counts.write_csv(gene_counts_path, separator="\t")
+            output_files[f"{genome_type}_gene_counts"] = gene_counts_path
+            
+            # Generate and save exon counts
+            exon_counts = self.generate_exon_counts(stats["overlaps"])
+            exon_counts_path = output_dir / f"{prefix}_{genome_type}_exon_counts.tsv"
+            exon_counts.write_csv(exon_counts_path, separator="\t")
+            output_files[f"{genome_type}_exon_counts"] = exon_counts_path
+        
+        return output_files
 
