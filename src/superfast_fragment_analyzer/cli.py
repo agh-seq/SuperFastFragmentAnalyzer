@@ -221,9 +221,10 @@ def compute_overlaps(
 @click.option(
     "--feature-type",
     "-f",
-    type=click.Choice(["gene", "exon", "intron", "promoter"], case_sensitive=False),
+    type=str,
+    multiple=True,
     default=None,
-    help="Feature type to generate counts for (gene, exon, intron, or promoter). 'gene' counts across all features. If not specified, generates counts for all features.",
+    help="Feature type(s) to generate counts for (gene, exon, intron, or promoter). Can be specified multiple times or as comma-separated list. 'gene' counts across all features. If not specified, generates counts for all features. Example: -f gene,exon,intron,promoter or -f gene -f exon",
 )
 @click.option(
     "--output-dir",
@@ -240,7 +241,7 @@ def compute_overlaps(
 )
 def generate_counts(
     overlaps_parquet: Path,
-    feature_type: Optional[str],
+    feature_type: tuple,
     output_dir: Optional[Path],
     prefix: Optional[str],
 ):
@@ -278,36 +279,66 @@ def generate_counts(
         overlaps_df = pl.read_parquet(overlaps_parquet)
         click.echo(f"  Loaded {len(overlaps_df)} overlap records")
         
-        # Generate counts for specified feature type or all features
-        # Each calculation is done separately for computational efficiency
-        if feature_type is None:
-            click.echo("Generating gene count table (all features combined)...")
-            counts = OverlapStats.generate_gene_counts(overlaps_df)
-            counts_path = output_dir / f"{prefix}_gene_counts.tsv"
-            feature_label = "all features"
+        # Parse feature types - handle both comma-separated strings and multiple flags
+        # Click's multiple=True returns a tuple of strings
+        valid_types = {"gene", "exon", "intron", "promoter"}
+        feature_types = []
+        
+        if not feature_type or len(feature_type) == 0:
+            feature_types = ["gene"]  # Default to gene if nothing specified
         else:
-            feature_type_lower = feature_type.lower()
-            
-            if feature_type_lower == "gene":
-                # Gene counts: count across ALL feature types
-                click.echo("Generating gene count table (across all feature types)...")
-                counts = OverlapStats.generate_gene_counts(overlaps_df)
-                counts_path = output_dir / f"{prefix}_gene_counts.tsv"
-                feature_label = "all features (gene-level)"
-            else:
-                # Feature-specific counts: filter by feature type
-                click.echo(f"Generating {feature_type_lower} count table (filtered by {feature_type_lower} only)...")
-                counts = OverlapStats.generate_feature_counts(overlaps_df, feature_type=feature_type_lower)
-                counts_path = output_dir / f"{prefix}_{feature_type_lower}_counts.tsv"
-                feature_label = feature_type_lower
+            # Process each item in the tuple (could be comma-separated or individual)
+            for ft_str in feature_type:
+                if not ft_str:
+                    continue
+                # Split on comma and process each
+                for ft in ft_str.split(","):
+                    ft_clean = ft.strip().lower()
+                    if ft_clean in valid_types:
+                        if ft_clean not in feature_types:  # Avoid duplicates
+                            feature_types.append(ft_clean)
+                    else:
+                        click.echo(f"Warning: '{ft.strip()}' is not a valid feature type. Valid types: {', '.join(valid_types)}", err=True)
         
-        counts.write_csv(counts_path, separator="\t")
-        click.echo(f"  Saved to: {counts_path}")
-        click.echo(f"  Total genes with {feature_label} overlaps: {len(counts)}")
-        if len(counts) > 0:
-            click.echo(f"  Top gene: {counts[0, 'gene_name']} ({counts[0, 'read_count']} reads)")
+        if not feature_types:
+            click.echo("Error: No valid feature types specified", err=True)
+            sys.exit(1)
         
-        click.echo(f"\nCount table saved to {output_dir}")
+        click.echo(f"\nGenerating count tables for {len(feature_types)} feature type(s): {', '.join(feature_types)}")
+        
+        # Generate counts for each feature type separately
+        # Each calculation is done independently for computational efficiency
+        generated_files = []
+        for i, feature_type_lower in enumerate(feature_types, 1):
+            try:
+                if feature_type_lower == "gene":
+                    # Gene counts: count across ALL feature types
+                    click.echo(f"\n  [{i}/{len(feature_types)}] Processing 'gene' (across all feature types)...")
+                    counts = OverlapStats.generate_gene_counts(overlaps_df)
+                    counts_path = output_dir / f"{prefix}_gene_counts.tsv"
+                    feature_label = "all features (gene-level)"
+                else:
+                    # Feature-specific counts: filter by feature type
+                    click.echo(f"\n  [{i}/{len(feature_types)}] Processing '{feature_type_lower}' (filtered by {feature_type_lower} only)...")
+                    counts = OverlapStats.generate_feature_counts(overlaps_df, feature_type=feature_type_lower)
+                    counts_path = output_dir / f"{prefix}_{feature_type_lower}_counts.tsv"
+                    feature_label = feature_type_lower
+                
+                counts.write_csv(counts_path, separator="\t")
+                generated_files.append(counts_path)
+                click.echo(f"    ✓ Saved to: {counts_path}")
+                click.echo(f"    Total genes with {feature_label} overlaps: {len(counts)}")
+                if len(counts) > 0:
+                    click.echo(f"    Top gene: {counts[0, 'gene_name']} ({counts[0, 'read_count']} reads)")
+            except Exception as e:
+                click.echo(f"    ✗ Error processing '{feature_type_lower}': {e}", err=True)
+                import traceback
+                traceback.print_exc()
+                continue  # Continue with next feature type
+        
+        click.echo(f"\n✓ Successfully generated {len(generated_files)} count table(s):")
+        for file_path in generated_files:
+            click.echo(f"  - {file_path}")
         
     except Exception as e:
         click.echo(f"Error: {e}", err=True)
