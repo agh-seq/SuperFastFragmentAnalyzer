@@ -174,17 +174,7 @@ def compute_overlaps(
         for stat_type, file_path in output_files.items():
             click.echo(f"  - {stat_type}: {file_path}")
         
-        # Clean up intermediate files if not keeping them
-        if not keep_parquet:
-            bed_parquet.unlink()
-            gtf_parquet.unlink()
-            click.echo(f"\nCleaned up intermediate Parquet files")
-        else:
-            click.echo(f"\nIntermediate Parquet files kept:")
-            click.echo(f"  - BED: {bed_parquet}")
-            click.echo(f"  - GTF features: {gtf_parquet}")
-        
-        # Print summary
+        # Print summary (before cleanup, since we need to read the parquet files)
         all_stats = overlap_stats.compute_all_statistics(debug=debug)
         click.echo("\n=== Summary Statistics ===")
         for genome_type in ["human", "pig", "combined"]:
@@ -208,6 +198,16 @@ def compute_overlaps(
                         f"    {row['feature_type']} - {row['size_category']}: "
                         f"{row['count']} reads{median_str}"
                     )
+        
+        # Clean up intermediate files if not keeping them (after summary is printed)
+        if not keep_parquet:
+            bed_parquet.unlink()
+            gtf_parquet.unlink()
+            click.echo(f"\nCleaned up intermediate Parquet files")
+        else:
+            click.echo(f"\nIntermediate Parquet files kept:")
+            click.echo(f"  - BED: {bed_parquet}")
+            click.echo(f"  - GTF features: {gtf_parquet}")
         
     except Exception as e:
         click.echo(f"Error: {e}", err=True)

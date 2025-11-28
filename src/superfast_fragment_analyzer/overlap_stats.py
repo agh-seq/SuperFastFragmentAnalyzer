@@ -180,7 +180,8 @@ class OverlapStats:
             result = pl.concat([result, frame])
         
         # Add size_category if missing
-        if "size_category" not in result.columns or result.select(pl.col("size_category").is_null().sum()).collect().item() > 0:
+        result_schema = result.collect_schema()
+        if "size_category" not in result_schema.names() or result.select(pl.col("size_category").is_null().sum()).collect().item() > 0:
             from superfast_fragment_analyzer.bed_processor import BedProcessor
             result = result.with_columns(
                 pl.when(pl.col("size_category").is_null())
