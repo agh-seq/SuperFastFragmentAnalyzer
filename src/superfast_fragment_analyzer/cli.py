@@ -124,6 +124,11 @@ def extract_features(gtf_file: Path, output: Optional[Path], biotype: Optional[s
     default=None,
     help="Filter GTF features by biotype (e.g., 'protein_coding'). If not specified, includes all biotypes.",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable debug output to diagnose chromosome matching issues",
+)
 def compute_overlaps(
     bed_file: Path,
     gtf_file: Path,
@@ -131,6 +136,7 @@ def compute_overlaps(
     prefix: str,
     keep_parquet: bool,
     biotype: Optional[str],
+    debug: bool,
 ):
     """Compute overlap statistics between BED reads and GTF features."""
     try:
@@ -162,7 +168,7 @@ def compute_overlaps(
         # Step 3: Compute overlaps from Parquet files using SQL
         click.echo("Computing overlap statistics from Parquet files...")
         overlap_stats = OverlapStats(bed_parquet, gtf_parquet)
-        output_files = overlap_stats.save_statistics_with_counts(output_dir, prefix)
+        output_files = overlap_stats.save_statistics_with_counts(output_dir, prefix, debug=debug)
         
         click.echo(f"\nStatistics saved to {output_dir}:")
         for stat_type, file_path in output_files.items():
@@ -179,7 +185,7 @@ def compute_overlaps(
             click.echo(f"  - GTF features: {gtf_parquet}")
         
         # Print summary
-        all_stats = overlap_stats.compute_all_statistics()
+        all_stats = overlap_stats.compute_all_statistics(debug=debug)
         click.echo("\n=== Summary Statistics ===")
         for genome_type in ["human", "pig", "combined"]:
             click.echo(f"\n{genome_type.upper()}:")

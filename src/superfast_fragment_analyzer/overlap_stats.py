@@ -50,6 +50,7 @@ class OverlapStats:
         self,
         reads_df: pl.LazyFrame,
         features_df: pl.LazyFrame,
+        debug: bool = False,
     ) -> pl.LazyFrame:
         """
         Compute overlaps between reads and features using interval joins.
@@ -57,6 +58,7 @@ class OverlapStats:
         Args:
             reads_df: Reads LazyFrame
             features_df: Features LazyFrame
+            debug: If True, print diagnostic information about chromosome matching
             
         Returns:
             LazyFrame with overlapping reads and their feature types
@@ -65,6 +67,16 @@ class OverlapStats:
         read_chromosomes = set(reads_df.select("chromosome").unique().collect()["chromosome"].to_list())
         feature_chromosomes = set(features_df.select("seqname").unique().collect()["seqname"].to_list())
         chromosomes = sorted(read_chromosomes & feature_chromosomes)
+        
+        if debug:
+            import sys
+            print(f"DEBUG: Read chromosomes ({len(read_chromosomes)}): {sorted(list(read_chromosomes))[:10]}...", file=sys.stderr)
+            print(f"DEBUG: Feature chromosomes ({len(feature_chromosomes)}): {sorted(list(feature_chromosomes))[:10]}...", file=sys.stderr)
+            print(f"DEBUG: Matching chromosomes ({len(chromosomes)}): {chromosomes[:10]}...", file=sys.stderr)
+            if not chromosomes:
+                print(f"DEBUG: No matching chromosomes found!", file=sys.stderr)
+                print(f"DEBUG: Read chromosomes sample: {sorted(list(read_chromosomes))[:20]}", file=sys.stderr)
+                print(f"DEBUG: Feature chromosomes sample: {sorted(list(feature_chromosomes))[:20]}", file=sys.stderr)
         
         if not chromosomes:
             return pl.LazyFrame(
@@ -185,6 +197,7 @@ class OverlapStats:
     def compute_statistics(
         self,
         genome_filter: Optional[str] = None,
+        debug: bool = False,
     ) -> Dict[str, pl.DataFrame]:
         """
         Compute overlap statistics.
@@ -204,7 +217,7 @@ class OverlapStats:
             features_df = features_df.filter(pl.col("genome") == genome_filter)
         
         # Compute overlaps (returns LazyFrame)
-        overlaps_lazy = self._compute_overlaps(reads_df, features_df)
+        overlaps_lazy = self._compute_overlaps(reads_df, features_df, debug=debug)
         
         # Materialize overlaps only when needed for statistics
         # First check if empty efficiently
@@ -348,9 +361,12 @@ class OverlapStats:
             "fragment_stats": fragment_stats_df,
         }
     
-    def compute_all_statistics(self) -> Dict[str, Dict[str, pl.DataFrame]]:
+    def compute_all_statistics(self, debug: bool = False) -> Dict[str, Dict[str, pl.DataFrame]]:
         """
         Compute statistics for human, pig, and combined genomes.
+        
+        Args:
+            debug: If True, print diagnostic information
         
         Returns:
             Dictionary with 'human', 'pig', and 'combined' statistics
@@ -358,13 +374,22 @@ class OverlapStats:
         results = {}
         
         # Human statistics
-        results["human"] = self.compute_statistics(genome_filter="human")
+        if debug:
+            import sys
+            print("DEBUG: Computing human statistics...", file=sys.stderr)
+        results["human"] = self.compute_statistics(genome_filter="human", debug=debug)
         
         # Pig statistics
-        results["pig"] = self.compute_statistics(genome_filter="pig")
+        if debug:
+            import sys
+            print("DEBUG: Computing pig statistics...", file=sys.stderr)
+        results["pig"] = self.compute_statistics(genome_filter="pig", debug=debug)
         
         # Combined statistics
-        results["combined"] = self.compute_statistics(genome_filter=None)
+        if debug:
+            import sys
+            print("DEBUG: Computing combined statistics...", file=sys.stderr)
+        results["combined"] = self.compute_statistics(genome_filter=None, debug=debug)
         
         return results
     
@@ -487,6 +512,7 @@ class OverlapStats:
         self,
         output_dir: Path,
         prefix: str = "overlap_stats",
+        debug: bool = False,
     ) -> Dict[str, Path]:
         """
         Save statistics to files including gene and exon count tables.
