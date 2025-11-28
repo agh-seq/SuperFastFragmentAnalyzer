@@ -221,9 +221,9 @@ def compute_overlaps(
 @click.option(
     "--feature-type",
     "-f",
-    type=click.Choice(["exon", "intron", "promoter"], case_sensitive=False),
+    type=click.Choice(["gene", "exon", "intron", "promoter"], case_sensitive=False),
     default=None,
-    help="Feature type to generate counts for (exon, intron, or promoter). If not specified, generates counts for all features.",
+    help="Feature type to generate counts for (gene, exon, intron, or promoter). 'gene' counts across all features. If not specified, generates counts for all features.",
 )
 @click.option(
     "--output-dir",
@@ -246,8 +246,10 @@ def generate_counts(
 ):
     """Generate gene count tables from existing overlaps parquet file.
     
-    Can generate counts for a specific feature type (exon, intron, promoter)
-    or for all features combined.
+    Can generate counts for a specific feature type (gene, exon, intron, promoter).
+    Each feature type is calculated separately for computational efficiency.
+    - 'gene': Counts reads per gene across ALL feature types (exon, intron, promoter)
+    - 'exon', 'intron', 'promoter': Counts reads per gene for that specific feature type only
     """
     try:
         overlaps_parquet = Path(overlaps_parquet)
@@ -277,17 +279,27 @@ def generate_counts(
         click.echo(f"  Loaded {len(overlaps_df)} overlap records")
         
         # Generate counts for specified feature type or all features
+        # Each calculation is done separately for computational efficiency
         if feature_type is None:
-            click.echo("Generating gene count table (all features)...")
-            counts = OverlapStats.generate_feature_counts(overlaps_df, feature_type=None)
+            click.echo("Generating gene count table (all features combined)...")
+            counts = OverlapStats.generate_gene_counts(overlaps_df)
             counts_path = output_dir / f"{prefix}_gene_counts.tsv"
             feature_label = "all features"
         else:
             feature_type_lower = feature_type.lower()
-            click.echo(f"Generating {feature_type_lower} count table...")
-            counts = OverlapStats.generate_feature_counts(overlaps_df, feature_type=feature_type_lower)
-            counts_path = output_dir / f"{prefix}_{feature_type_lower}_counts.tsv"
-            feature_label = feature_type_lower
+            
+            if feature_type_lower == "gene":
+                # Gene counts: count across ALL feature types
+                click.echo("Generating gene count table (across all feature types)...")
+                counts = OverlapStats.generate_gene_counts(overlaps_df)
+                counts_path = output_dir / f"{prefix}_gene_counts.tsv"
+                feature_label = "all features (gene-level)"
+            else:
+                # Feature-specific counts: filter by feature type
+                click.echo(f"Generating {feature_type_lower} count table (filtered by {feature_type_lower} only)...")
+                counts = OverlapStats.generate_feature_counts(overlaps_df, feature_type=feature_type_lower)
+                counts_path = output_dir / f"{prefix}_{feature_type_lower}_counts.tsv"
+                feature_label = feature_type_lower
         
         counts.write_csv(counts_path, separator="\t")
         click.echo(f"  Saved to: {counts_path}")
