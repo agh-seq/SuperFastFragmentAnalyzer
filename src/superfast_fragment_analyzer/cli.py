@@ -451,6 +451,104 @@ def inspect_gtf(gtf_file: Path, sample_lines: int):
         sys.exit(1)
 
 
+@main.command()
+@click.argument("parquet_file", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--type",
+    "-t",
+    type=click.Choice(["bed", "gtf"], case_sensitive=False),
+    required=True,
+    help="Type of parquet file: 'bed' for BED reads or 'gtf' for GTF features",
+)
+def inspect_parquet(parquet_file: Path, type: str):
+    """Inspect parquet file to check chromosome names and genome classification."""
+    try:
+        parquet_file = Path(parquet_file)
+        click.echo(f"Inspecting {type.upper()} parquet file: {parquet_file}")
+        
+        df = pl.read_parquet(parquet_file)
+        click.echo(f"\nTotal records: {len(df)}")
+        click.echo(f"Columns: {', '.join(df.columns)}")
+        
+        if type.lower() == "bed":
+            # BED file inspection
+            if "chromosome" not in df.columns:
+                click.echo("Error: 'chromosome' column not found", err=True)
+                sys.exit(1)
+            
+            click.echo("\n=== Chromosome Names ===")
+            chrom_counts = df["chromosome"].value_counts().sort("count", descending=True)
+            click.echo(f"Unique chromosomes: {len(chrom_counts)}")
+            click.echo("\nTop 30 chromosomes:")
+            for row in chrom_counts.head(30).iter_rows(named=True):
+                click.echo(f"  {row['chromosome']}: {row['count']} records")
+            
+            if "genome" in df.columns:
+                click.echo("\n=== Genome Classification ===")
+                genome_counts = df["genome"].value_counts()
+                for row in genome_counts.iter_rows(named=True):
+                    click.echo(f"  {row['genome']}: {row['count']} records")
+                
+                # Show chromosomes by genome
+                for genome_type in ["human", "pig", "unknown"]:
+                    genome_chroms = (
+                        df
+                        .filter(pl.col("genome") == genome_type)
+                        .select("chromosome")
+                        .unique()
+                        .sort("chromosome")
+                    )
+                    if len(genome_chroms) > 0:
+                        click.echo(f"\n  {genome_type.upper()} chromosomes ({len(genome_chroms)}):")
+                        chrom_list = genome_chroms["chromosome"].to_list()
+                        for chrom in chrom_list[:30]:
+                            click.echo(f"    {chrom}")
+                        if len(chrom_list) > 30:
+                            click.echo(f"    ... and {len(chrom_list) - 30} more")
+        
+        elif type.lower() == "gtf":
+            # GTF features file inspection
+            if "seqname" not in df.columns:
+                click.echo("Error: 'seqname' column not found", err=True)
+                sys.exit(1)
+            
+            click.echo("\n=== Chromosome Names (seqname) ===")
+            chrom_counts = df["seqname"].value_counts().sort("count", descending=True)
+            click.echo(f"Unique chromosomes: {len(chrom_counts)}")
+            click.echo("\nTop 30 chromosomes:")
+            for row in chrom_counts.head(30).iter_rows(named=True):
+                click.echo(f"  {row['seqname']}: {row['count']} records")
+            
+            if "genome" in df.columns:
+                click.echo("\n=== Genome Classification ===")
+                genome_counts = df["genome"].value_counts()
+                for row in genome_counts.iter_rows(named=True):
+                    click.echo(f"  {row['genome']}: {row['count']} records")
+                
+                # Show chromosomes by genome
+                for genome_type in ["human", "pig", "unknown"]:
+                    genome_chroms = (
+                        df
+                        .filter(pl.col("genome") == genome_type)
+                        .select("seqname")
+                        .unique()
+                        .sort("seqname")
+                    )
+                    if len(genome_chroms) > 0:
+                        click.echo(f"\n  {genome_type.upper()} chromosomes ({len(genome_chroms)}):")
+                        chrom_list = genome_chroms["seqname"].to_list()
+                        for chrom in chrom_list[:30]:
+                            click.echo(f"    {chrom}")
+                        if len(chrom_list) > 30:
+                            click.echo(f"    ... and {len(chrom_list) - 30} more")
+        
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     main()
 
