@@ -333,22 +333,23 @@ class GtfProcessor:
                 all_features.extend(introns)
                 all_features.extend(promoters)
         
-        # Convert to DataFrame
-        if not all_features:
-            return pl.DataFrame(
-                schema={
-                    "seqname": pl.Utf8,
-                    "start": pl.Int64,
-                    "end": pl.Int64,
-                    "feature_type": pl.Utf8,
-                    "gene_id": pl.Utf8,
-                    "gene_name": pl.Utf8,
-                    "genome": pl.Utf8,
-                    "strand": pl.Utf8,
-                }
-            )
+        # Convert to DataFrame with explicit schema to avoid inference issues
+        schema = {
+            "seqname": pl.Utf8,
+            "start": pl.Int64,
+            "end": pl.Int64,
+            "feature_type": pl.Utf8,
+            "gene_id": pl.Utf8,
+            "gene_name": pl.Utf8,
+            "genome": pl.Utf8,
+            "strand": pl.Utf8,
+        }
         
-        return pl.DataFrame(all_features)
+        if not all_features:
+            return pl.DataFrame(schema=schema)
+        
+        # Use explicit schema to handle None values and ensure consistent types
+        return pl.DataFrame(all_features, schema=schema)
     
     def split_by_genome(self) -> Tuple[pl.DataFrame, pl.DataFrame]:
         """
