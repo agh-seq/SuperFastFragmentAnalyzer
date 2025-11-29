@@ -168,14 +168,13 @@ def compute_overlaps(
         # Step 3: Compute overlaps from Parquet files using SQL
         click.echo("Computing overlap statistics from Parquet files...")
         overlap_stats = OverlapStats(bed_parquet, gtf_parquet)
-        output_files = overlap_stats.save_statistics_with_counts(output_dir, prefix, debug=debug)
+        output_files, all_stats = overlap_stats.save_statistics_with_counts(output_dir, prefix, debug=debug)
         
         click.echo(f"\nStatistics saved to {output_dir}:")
         for stat_type, file_path in output_files.items():
             click.echo(f"  - {stat_type}: {file_path}")
         
-        # Print summary (before cleanup, since we need to read the parquet files)
-        all_stats = overlap_stats.compute_all_statistics(debug=debug)
+        # Print summary using already-computed statistics (no recomputation needed)
         click.echo("\n=== Summary Statistics ===")
         for genome_type in ["human", "pig", "combined"]:
             click.echo(f"\n{genome_type.upper()}:")

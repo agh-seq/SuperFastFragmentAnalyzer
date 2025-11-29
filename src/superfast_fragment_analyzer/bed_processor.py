@@ -73,6 +73,10 @@ class BedProcessor:
             schema={"chromosome": pl.Utf8, "start": pl.Int64, "end": pl.Int64},
         )
         
+        # Filter out invalid records where end <= start
+        # This handles cases where end position is 0 or less than start
+        df_lazy = df_lazy.filter(pl.col("end") > pl.col("start"))
+        
         # Calculate fragment length (end - start)
         df_lazy = df_lazy.with_columns(
             (pl.col("end") - pl.col("start")).alias("fragment_length")

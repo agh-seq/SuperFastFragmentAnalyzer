@@ -467,6 +467,9 @@ class OverlapStats:
                 raise ValueError(f"feature_type must be 'exon', 'intron', 'promoter', or None, got: {feature_type}")
             filtered_df = overlaps_df.filter(pl.col("feature_type") == feature_type)
         
+        # Filter out any invalid records where read_end <= read_start (safety check)
+        filtered_df = filtered_df.filter(pl.col("read_end") > pl.col("read_start"))
+        
         # Generate counts
         counts = (
             filtered_df
@@ -514,21 +517,22 @@ class OverlapStats:
         output_dir: Path,
         prefix: str = "overlap_stats",
         debug: bool = False,
-    ) -> Dict[str, Path]:
+    ) -> tuple[Dict[str, Path], Dict[str, Dict[str, pl.DataFrame]]]:
         """
         Save statistics to files including gene and exon count tables.
         
         Args:
             output_dir: Directory to save statistics files
             prefix: Prefix for output files
+            debug: If True, print diagnostic information
             
         Returns:
-            Dictionary mapping statistic type to output file path
+            Tuple of (output_files_dict, all_stats_dict) to avoid recomputation
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        all_stats = self.compute_all_statistics()
+        all_stats = self.compute_all_statistics(debug=debug)
         output_files = {}
         
         for genome_type, stats in all_stats.items():
@@ -559,5 +563,5 @@ class OverlapStats:
             exon_counts.write_csv(exon_counts_path, separator="\t")
             output_files[f"{genome_type}_exon_counts"] = exon_counts_path
         
-        return output_files
+        return output_files, all_stats
 
