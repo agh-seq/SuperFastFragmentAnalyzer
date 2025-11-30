@@ -125,6 +125,13 @@ def extract_features(gtf_file: Path, output: Optional[Path], biotype: Optional[s
     help="Filter GTF features by biotype (e.g., 'protein_coding'). If not specified, includes all biotypes.",
 )
 @click.option(
+    "--genome-filter",
+    "-g",
+    type=click.Choice(["human", "pig"], case_sensitive=False),
+    default=None,
+    help="Filter to only process reads from specified genome (human or pig). This significantly speeds up processing for large files. If not specified, processes all reads.",
+)
+@click.option(
     "--debug",
     is_flag=True,
     help="Enable debug output to diagnose chromosome matching issues",
@@ -136,6 +143,7 @@ def compute_overlaps(
     prefix: str,
     keep_parquet: bool,
     biotype: Optional[str],
+    genome_filter: Optional[str],
     debug: bool,
 ):
     """Compute overlap statistics between BED reads and GTF features."""
@@ -143,14 +151,17 @@ def compute_overlaps(
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Step 1: Convert BED to Parquet
+        # Step 1: Convert BED to Parquet (with genome filter if specified)
         click.echo(f"Converting BED file to Parquet: {bed_file}")
+        if genome_filter:
+            click.echo(f"  Filtering to {genome_filter} reads only (this will speed up processing!)")
         bed_parquet = output_dir / f"{prefix}_bed.parquet"
         bed_processor = BedProcessor(bed_file)
         bed_processor.to_parquet(
             output_path=bed_parquet,
             compression="zstd",
             compression_level=3,
+            genome_filter=genome_filter,
         )
         click.echo(f"  Saved to: {bed_parquet}")
         
@@ -161,14 +172,54 @@ def compute_overlaps(
         gtf_parquet = output_dir / f"{prefix}_gtf_features.parquet"
         gtf_processor = GtfProcessor(gtf_file)
         features_df = gtf_processor.extract_features(biotype_filter=biotype)
+        
+        # Also filter GTF features by genome if specified
+        if genome_filter:
+            features_df = features_df.filter(pl.col("genome") == genome_filter)
+            click.echo(f"  Filtered GTF features to {genome_filter} only")
+        
         features_df.write_parquet(gtf_parquet, compression="zstd", compression_level=3)
         click.echo(f"  Saved to: {gtf_parquet}")
         click.echo(f"  Extracted {len(features_df)} features")
         
-        # Step 3: Compute overlaps from Parquet files using SQL
+        # Step 3: Compute overlaps from Parquet files
         click.echo("Computing overlap statistics from Parquet files...")
         overlap_stats = OverlapStats(bed_parquet, gtf_parquet)
-        output_files, all_stats = overlap_stats.save_statistics_with_counts(output_dir, prefix, debug=debug)
+        
+        # If genome_filter is specified, only compute statistics for that genome
+        if genome_filter:
+            output_files = {}
+            all_stats = {}
+            stats = overlap_stats.compute_statistics(genome_filter=genome_filter, debug=debug)
+            all_stats[genome_filter] = stats
+            
+            # Save statistics for the filtered genome
+            summary_path = output_dir / f"{prefix}_{genome_filter}_summary.tsv"
+            stats["summary"].write_csv(summary_path, separator="\t")
+            output_files[f"{genome_filter}_summary"] = summary_path
+            
+            fragment_stats_path = output_dir / f"{prefix}_{genome_filter}_fragment_stats.tsv"
+            stats["fragment_stats"].write_csv(fragment_stats_path, separator="\t")
+            output_files[f"{genome_filter}_fragment_stats"] = fragment_stats_path
+            
+            overlaps_path = output_dir / f"{prefix}_{genome_filter}_overlaps.parquet"
+            stats["overlaps"].write_parquet(overlaps_path)
+            output_files[f"{genome_filter}_overlaps"] = overlaps_path
+            
+            # Generate and save gene counts
+            gene_counts = OverlapStats.generate_gene_counts(stats["overlaps"])
+            gene_counts_path = output_dir / f"{prefix}_{genome_filter}_gene_counts.tsv"
+            gene_counts.write_csv(gene_counts_path, separator="\t")
+            output_files[f"{genome_filter}_gene_counts"] = gene_counts_path
+            
+            # Generate and save exon counts
+            exon_counts = OverlapStats.generate_exon_counts(stats["overlaps"])
+            exon_counts_path = output_dir / f"{prefix}_{genome_filter}_exon_counts.tsv"
+            exon_counts.write_csv(exon_counts_path, separator="\t")
+            output_files[f"{genome_filter}_exon_counts"] = exon_counts_path
+        else:
+            # Original behavior: compute all statistics
+            output_files, all_stats = overlap_stats.save_statistics_with_counts(output_dir, prefix, debug=debug)
         
         click.echo(f"\nStatistics saved to {output_dir}:")
         for stat_type, file_path in output_files.items():
@@ -176,7 +227,8 @@ def compute_overlaps(
         
         # Print summary using already-computed statistics (no recomputation needed)
         click.echo("\n=== Summary Statistics ===")
-        for genome_type in ["human", "pig", "combined"]:
+        genome_types = [genome_filter] if genome_filter else ["human", "pig", "combined"]
+        for genome_type in genome_types:
             click.echo(f"\n{genome_type.upper()}:")
             summary = all_stats[genome_type]["summary"]
             for row in summary.iter_rows(named=True):
