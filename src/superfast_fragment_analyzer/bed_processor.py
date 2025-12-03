@@ -57,9 +57,14 @@ class BedProcessor:
         else:
             return "tri-nucleosome"
     
-    def read_bed(self) -> pl.DataFrame:
+    def read_bed(self, genome_filter: Optional[str] = None) -> pl.DataFrame:
         """
         Read 3-column BED file into Polars DataFrame.
+        
+        Args:
+            genome_filter: Filter by genome type ('human', 'pig', or None for all).
+                          Filtering at this stage significantly speeds up processing
+                          for large files by avoiding loading unwanted reads.
         
         Returns:
             DataFrame with columns: chromosome, start, end, fragment_length, size_category, genome
@@ -72,6 +77,18 @@ class BedProcessor:
             new_columns=["chromosome", "start", "end"],
             schema={"chromosome": pl.Utf8, "start": pl.Int64, "end": pl.Int64},
         )
+        
+        # Filter by genome BEFORE processing if specified (much faster!)
+        # This happens during CSV scanning, so unwanted reads are never loaded
+        if genome_filter == "pig":
+            df_lazy = df_lazy.filter(pl.col("chromosome").str.starts_with("NC_"))
+        elif genome_filter == "human":
+            df_lazy = df_lazy.filter(pl.col("chromosome").str.starts_with("chr"))
+        # If None, process all reads
+        
+        # Filter out invalid records where end <= start
+        # This handles cases where end position is 0 or less than start
+        df_lazy = df_lazy.filter(pl.col("end") > pl.col("start"))
         
         # Calculate fragment length (end - start)
         df_lazy = df_lazy.with_columns(
@@ -108,6 +125,7 @@ class BedProcessor:
         output_path: Optional[Path] = None,
         compression: str = "zstd",
         compression_level: int = 3,
+        genome_filter: Optional[str] = None,
     ) -> Path:
         """
         Convert BED file to Parquet format.
@@ -116,6 +134,9 @@ class BedProcessor:
             output_path: Output Parquet file path. If None, uses bed_file with .parquet extension
             compression: Compression algorithm (default: zstd)
             compression_level: Compression level (default: 3)
+            genome_filter: Filter by genome type ('human', 'pig', or None for all).
+                          Filtering at this stage significantly speeds up processing
+                          for large files by avoiding loading unwanted reads.
             
         Returns:
             Path to created Parquet file
@@ -125,7 +146,7 @@ class BedProcessor:
         else:
             output_path = Path(output_path)
         
-        df = self.read_bed()
+        df = self.read_bed(genome_filter=genome_filter)
         
         # Write to Parquet with compression
         df.write_parquet(

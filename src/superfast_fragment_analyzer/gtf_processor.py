@@ -117,19 +117,33 @@ class GtfProcessor:
             pl.col("attributes")
             .str.extract(r'gene_name\s+"([^"]+)"', 1)
             .alias("gene_name"),
-            # Extract gene_biotype (preferred)
+            # Extract gene_biotype (Ensembl/RefSeq format)
             pl.col("attributes")
             .str.extract(r'gene_biotype\s+"([^"]+)"', 1)
             .alias("gene_biotype"),
-            # Extract transcript_biotype (fallback)
+            # Extract transcript_biotype (Ensembl/RefSeq format)
             pl.col("attributes")
             .str.extract(r'transcript_biotype\s+"([^"]+)"', 1)
             .alias("transcript_biotype"),
+            # Extract gene_type (GENCODE format)
+            pl.col("attributes")
+            .str.extract(r'gene_type\s+"([^"]+)"', 1)
+            .alias("gene_type"),
+            # Extract transcript_type (GENCODE format)
+            pl.col("attributes")
+            .str.extract(r'transcript_type\s+"([^"]+)"', 1)
+            .alias("transcript_type"),
         ])
         
-        # Use gene_biotype if available, otherwise use transcript_biotype
+        # Use gene_biotype/gene_type if available, otherwise use transcript_biotype/transcript_type
+        # Priority: gene_biotype > gene_type > transcript_biotype > transcript_type
         df = df.with_columns(
-            pl.coalesce([pl.col("gene_biotype"), pl.col("transcript_biotype")])
+            pl.coalesce([
+                pl.col("gene_biotype"),
+                pl.col("gene_type"),
+                pl.col("transcript_biotype"),
+                pl.col("transcript_type")
+            ])
             .alias("biotype")
         )
         
@@ -319,22 +333,23 @@ class GtfProcessor:
                 all_features.extend(introns)
                 all_features.extend(promoters)
         
-        # Convert to DataFrame
-        if not all_features:
-            return pl.DataFrame(
-                schema={
-                    "seqname": pl.Utf8,
-                    "start": pl.Int64,
-                    "end": pl.Int64,
-                    "feature_type": pl.Utf8,
-                    "gene_id": pl.Utf8,
-                    "gene_name": pl.Utf8,
-                    "genome": pl.Utf8,
-                    "strand": pl.Utf8,
-                }
-            )
+        # Convert to DataFrame with explicit schema to avoid inference issues
+        schema = {
+            "seqname": pl.Utf8,
+            "start": pl.Int64,
+            "end": pl.Int64,
+            "feature_type": pl.Utf8,
+            "gene_id": pl.Utf8,
+            "gene_name": pl.Utf8,
+            "genome": pl.Utf8,
+            "strand": pl.Utf8,
+        }
         
-        return pl.DataFrame(all_features)
+        if not all_features:
+            return pl.DataFrame(schema=schema)
+        
+        # Use explicit schema to handle None values and ensure consistent types
+        return pl.DataFrame(all_features, schema=schema)
     
     def split_by_genome(self) -> Tuple[pl.DataFrame, pl.DataFrame]:
         """

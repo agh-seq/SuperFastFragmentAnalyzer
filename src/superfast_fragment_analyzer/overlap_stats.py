@@ -50,6 +50,7 @@ class OverlapStats:
         self,
         reads_df: pl.LazyFrame,
         features_df: pl.LazyFrame,
+        debug: bool = False,
     ) -> pl.LazyFrame:
         """
         Compute overlaps between reads and features using interval joins.
@@ -57,6 +58,7 @@ class OverlapStats:
         Args:
             reads_df: Reads LazyFrame
             features_df: Features LazyFrame
+            debug: If True, print diagnostic information about chromosome matching
             
         Returns:
             LazyFrame with overlapping reads and their feature types
@@ -65,6 +67,16 @@ class OverlapStats:
         read_chromosomes = set(reads_df.select("chromosome").unique().collect()["chromosome"].to_list())
         feature_chromosomes = set(features_df.select("seqname").unique().collect()["seqname"].to_list())
         chromosomes = sorted(read_chromosomes & feature_chromosomes)
+        
+        if debug:
+            import sys
+            print(f"DEBUG: Read chromosomes ({len(read_chromosomes)}): {sorted(list(read_chromosomes))[:10]}...", file=sys.stderr)
+            print(f"DEBUG: Feature chromosomes ({len(feature_chromosomes)}): {sorted(list(feature_chromosomes))[:10]}...", file=sys.stderr)
+            print(f"DEBUG: Matching chromosomes ({len(chromosomes)}): {chromosomes[:10]}...", file=sys.stderr)
+            if not chromosomes:
+                print(f"DEBUG: No matching chromosomes found!", file=sys.stderr)
+                print(f"DEBUG: Read chromosomes sample: {sorted(list(read_chromosomes))[:20]}", file=sys.stderr)
+                print(f"DEBUG: Feature chromosomes sample: {sorted(list(feature_chromosomes))[:20]}", file=sys.stderr)
         
         if not chromosomes:
             return pl.LazyFrame(
@@ -168,7 +180,8 @@ class OverlapStats:
             result = pl.concat([result, frame])
         
         # Add size_category if missing
-        if "size_category" not in result.columns or result.select(pl.col("size_category").is_null().sum()).collect().item() > 0:
+        result_schema = result.collect_schema()
+        if "size_category" not in result_schema.names() or result.select(pl.col("size_category").is_null().sum()).collect().item() > 0:
             from superfast_fragment_analyzer.bed_processor import BedProcessor
             result = result.with_columns(
                 pl.when(pl.col("size_category").is_null())
@@ -185,6 +198,7 @@ class OverlapStats:
     def compute_statistics(
         self,
         genome_filter: Optional[str] = None,
+        debug: bool = False,
     ) -> Dict[str, pl.DataFrame]:
         """
         Compute overlap statistics.
@@ -204,7 +218,7 @@ class OverlapStats:
             features_df = features_df.filter(pl.col("genome") == genome_filter)
         
         # Compute overlaps (returns LazyFrame)
-        overlaps_lazy = self._compute_overlaps(reads_df, features_df)
+        overlaps_lazy = self._compute_overlaps(reads_df, features_df, debug=debug)
         
         # Materialize overlaps only when needed for statistics
         # First check if empty efficiently
@@ -348,9 +362,12 @@ class OverlapStats:
             "fragment_stats": fragment_stats_df,
         }
     
-    def compute_all_statistics(self) -> Dict[str, Dict[str, pl.DataFrame]]:
+    def compute_all_statistics(self, debug: bool = False) -> Dict[str, Dict[str, pl.DataFrame]]:
         """
         Compute statistics for human, pig, and combined genomes.
+        
+        Args:
+            debug: If True, print diagnostic information
         
         Returns:
             Dictionary with 'human', 'pig', and 'combined' statistics
@@ -358,13 +375,22 @@ class OverlapStats:
         results = {}
         
         # Human statistics
-        results["human"] = self.compute_statistics(genome_filter="human")
+        if debug:
+            import sys
+            print("DEBUG: Computing human statistics...", file=sys.stderr)
+        results["human"] = self.compute_statistics(genome_filter="human", debug=debug)
         
         # Pig statistics
-        results["pig"] = self.compute_statistics(genome_filter="pig")
+        if debug:
+            import sys
+            print("DEBUG: Computing pig statistics...", file=sys.stderr)
+        results["pig"] = self.compute_statistics(genome_filter="pig", debug=debug)
         
         # Combined statistics
-        results["combined"] = self.compute_statistics(genome_filter=None)
+        if debug:
+            import sys
+            print("DEBUG: Computing combined statistics...", file=sys.stderr)
+        results["combined"] = self.compute_statistics(genome_filter=None, debug=debug)
         
         return results
     
@@ -406,4 +432,136 @@ class OverlapStats:
             output_files[f"{genome_type}_overlaps"] = overlaps_path
         
         return output_files
+    
+    @staticmethod
+    def generate_feature_counts(
+        overlaps_df: pl.DataFrame,
+        feature_type: Optional[str] = None,
+    ) -> pl.DataFrame:
+        """
+        Generate gene count table filtered by feature type.
+        
+        Counts unique reads per gene for a specific feature type (exon, intron, promoter)
+        or across all feature types if None.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, feature_type, read_start, read_end
+            feature_type: Feature type to filter by ('exon', 'intron', 'promoter', or None for all)
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        if overlaps_df.is_empty():
+            return pl.DataFrame(
+                schema={
+                    "gene_id": pl.Utf8,
+                    "gene_name": pl.Utf8,
+                    "read_count": pl.Int64,
+                }
+            )
+        
+        # Filter by feature type if specified
+        filtered_df = overlaps_df
+        if feature_type is not None:
+            if feature_type not in ["exon", "intron", "promoter"]:
+                raise ValueError(f"feature_type must be 'exon', 'intron', 'promoter', or None, got: {feature_type}")
+            filtered_df = overlaps_df.filter(pl.col("feature_type") == feature_type)
+        
+        # Filter out any invalid records where read_end <= read_start (safety check)
+        filtered_df = filtered_df.filter(pl.col("read_end") > pl.col("read_start"))
+        
+        # Generate counts
+        counts = (
+            filtered_df
+            .select(["gene_id", "gene_name", "read_start", "read_end"])
+            .unique(subset=["gene_id", "read_start", "read_end"])  # Count each read only once per gene
+            .group_by(["gene_id", "gene_name"])
+            .agg(pl.count().alias("read_count"))
+            .sort("read_count", descending=True)
+        )
+        
+        return counts
+    
+    @staticmethod
+    def generate_gene_counts(overlaps_df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Generate gene count table from overlaps DataFrame.
+        
+        Counts unique reads per gene across all feature types.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, read_start, read_end
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        return OverlapStats.generate_feature_counts(overlaps_df, feature_type=None)
+    
+    @staticmethod
+    def generate_exon_counts(overlaps_df: pl.DataFrame) -> pl.DataFrame:
+        """
+        Generate exon count table with per-gene aggregate counts over exons.
+        
+        Counts unique reads per gene that overlap exons.
+        
+        Args:
+            overlaps_df: Overlaps DataFrame with columns: gene_id, gene_name, feature_type, read_start, read_end
+            
+        Returns:
+            DataFrame with columns: gene_id, gene_name, read_count
+        """
+        return OverlapStats.generate_feature_counts(overlaps_df, feature_type="exon")
+    
+    def save_statistics_with_counts(
+        self,
+        output_dir: Path,
+        prefix: str = "overlap_stats",
+        debug: bool = False,
+    ) -> tuple[Dict[str, Path], Dict[str, Dict[str, pl.DataFrame]]]:
+        """
+        Save statistics to files including gene and exon count tables.
+        
+        Args:
+            output_dir: Directory to save statistics files
+            prefix: Prefix for output files
+            debug: If True, print diagnostic information
+            
+        Returns:
+            Tuple of (output_files_dict, all_stats_dict) to avoid recomputation
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        all_stats = self.compute_all_statistics(debug=debug)
+        output_files = {}
+        
+        for genome_type, stats in all_stats.items():
+            # Save summary
+            summary_path = output_dir / f"{prefix}_{genome_type}_summary.tsv"
+            stats["summary"].write_csv(summary_path, separator="\t")
+            output_files[f"{genome_type}_summary"] = summary_path
+            
+            # Save fragment length statistics
+            fragment_stats_path = output_dir / f"{prefix}_{genome_type}_fragment_stats.tsv"
+            stats["fragment_stats"].write_csv(fragment_stats_path, separator="\t")
+            output_files[f"{genome_type}_fragment_stats"] = fragment_stats_path
+            
+            # Save detailed overlaps
+            overlaps_path = output_dir / f"{prefix}_{genome_type}_overlaps.parquet"
+            stats["overlaps"].write_parquet(overlaps_path)
+            output_files[f"{genome_type}_overlaps"] = overlaps_path
+            
+            # Generate and save gene counts
+            gene_counts = self.generate_gene_counts(stats["overlaps"])
+            gene_counts_path = output_dir / f"{prefix}_{genome_type}_gene_counts.tsv"
+            gene_counts.write_csv(gene_counts_path, separator="\t")
+            output_files[f"{genome_type}_gene_counts"] = gene_counts_path
+            
+            # Generate and save exon counts
+            exon_counts = self.generate_exon_counts(stats["overlaps"])
+            exon_counts_path = output_dir / f"{prefix}_{genome_type}_exon_counts.tsv"
+            exon_counts.write_csv(exon_counts_path, separator="\t")
+            output_files[f"{genome_type}_exon_counts"] = exon_counts_path
+        
+        return output_files, all_stats
 
